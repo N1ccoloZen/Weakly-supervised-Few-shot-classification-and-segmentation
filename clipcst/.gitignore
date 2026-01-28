@@ -1,0 +1,5 @@
+debug_outputs/
+log_files/
+trained_models/
+vis_results/
+wandb/
