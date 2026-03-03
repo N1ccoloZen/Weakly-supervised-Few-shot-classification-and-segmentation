@@ -47,7 +47,9 @@ class ClfSegTransformer(FSCSModule):
         self.sptsize = int(int(args.imgsize // 16) // 4)
         self.layers_to_take = args.nlayers if args.nlayers <= self.backbone.vision.depth else self.backbone.vision.depth
 
-        self.text_project = torch.nn.Linear(self.backbone.embed_dim, self.backbone.vision_dim)  #[512->384]
+        if args.use_text:
+            self.text_project = torch.nn.Linear(self.backbone.embed_dim, self.backbone.vision_dim) #[512->384]
+            self.use_text = True
 
         #self.temperature = torch.nn.Parameter(torch.ones(1) * np.log(1/0.07)).to(self.device)
         
@@ -60,22 +62,28 @@ class ClfSegTransformer(FSCSModule):
             v.requires_grad = False
         self.learner = CorrelationTransformer([self.nhead * self.layers_to_take], args.way, clip_dim=self.backbone.embed_dim)
         
-        sam_url = 'https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth'
-        model_type = 'vit_b'
+        if args.use_sam:
+            sam_url = 'https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth'
+            model_type = 'vit_b'
 
-        sam_state_dict = torch.hub.load_state_dict_from_url(sam_url)
+            sam_state_dict = torch.hub.load_state_dict_from_url(sam_url)
 
-        self.sam = sam_model_registry[model_type](checkpoint=sam_state_dict)
-        self.sam.to(self.device)
+            self.sam = sam_model_registry[model_type](checkpoint=sam_state_dict)
+            self.sam.to(self.device)
 
-        for k, p in self.sam.named_parameters():
-            p.requires_grad = False
+            for k, p in self.sam.named_parameters():
+                p.requires_grad = False
 
-        self.predictor = SamPredictor(self.sam)
+            self.predictor = SamPredictor(self.sam)
+            self.use_sam = True
 
-        from pathlib import Path
-        self.debug_dir = Path("debug_outputs")
-        self.debug_dir.mkdir(parents=True, exist_ok=True)
+        if args.debug:
+            from pathlib import Path
+            self.debug_dir_refine = Path("debug_outputs/mask_to_refine")
+            self.debug_dir_refine.mkdir(parents=True, exist_ok=True)
+
+            self.debug_dir_mask = Path("debug_outputs/mask_GradCAM")
+            self.debug_dir_mask.mkdir(parents=True, exist_ok=True)
 
         '''
         self.momentum_backbone = CLIPFeatureExtractor()
@@ -113,8 +121,6 @@ class ClfSegTransformer(FSCSModule):
         tokenized_labels = tokenized_labels.view(-1, tokenized_labels.size(-1))
         #query_presence = batch['query_class_presence']
         #print(f'In the qry there are these classes: \n{query_presence}')
-        
-        #temp = torch.clamp(self.temp, min=0.01, max=7.0)
 
         spt_img = rearrange(batch['support_imgs'].squeeze(2), 'b n c h w -> (b n) c h w')
         spt_mask = None if self.sup == 'pseudo' else rearrange(batch['support_masks'].squeeze(2), 'b n h w -> (b n) h w')
@@ -124,30 +130,7 @@ class ClfSegTransformer(FSCSModule):
         qry_img = qry_img.to(memory_format=torch.channels_last)
    
         B, C, H, W = qry_img.shape
-        #print('--> Shape of qry_img is: ', qry_img.shape)
-        #print('--> Shape of qry_feats is: ', qry_feats.shape)
-        #print('--> Shape of spt_feats is: ', spt_feats.shape)
-        '''
-        if self.sup == 'pseudo':
-            model = self.backbone
-
-            #for m, b in model.named_parameters():
-                #b.requires_grad = True
-
-            target_layer = model.vision.block[-1].norm1
-
-            with torch.no_grad():
-                text_feats = self.backbone.encode_text(tokenized_labels)
-                text_feat = text_feats['embedding'] #[8, 512]
-
-                text_feat = F.normalize(text_feat, dim=-1)
-
-            gradcam = GradCAM(model, target_layer)
-            qry_mask = gradcam(qry_img, text_feat)
-            spt_mask = gradcam(spt_img, text_feat)
-
-        #print(f'Size and type of query mask {qry_mask.shape} and {qry_mask}')
-        '''
+        
         with torch.no_grad():
 
             qry_feats_extr = self.extract_clip_feats(qry_img, return_qkv=self.sup == 'pseudo')
@@ -170,100 +153,115 @@ class ClfSegTransformer(FSCSModule):
                 
                 qry_qkv = torch.stack([qry_q, qry_k, qry_v], dim=0)
                 spt_qkv = torch.stack([spt_q, spt_k, spt_v], dim=0)
-                
-                #target_layer = self.backbone.vision.block[-1].norm2
 
                 resize = (self.imgsize, self.imgsize) if self.training else (batch['org_query_imsize'][1].item(), batch['org_query_imsize'][0].item())
                 
-                
-                with torch.enable_grad():
-                    mask_s, spt_points, qry_mask, qry_points = self.generate_pseudo_mask(qry_qkv, spt_qkv, text_feat, class_gt=batch['query_class_presence'].flatten(), thr=0.4, resize=resize, qry_img=qry_img, spt_img=spt_img)
-                
-                spt_mask = []
+                if self.use_text:
+                    with torch.enable_grad():
+                        mask_s, spt_points, qry_mask, qry_points = self.generate_pseudo_mask(qry_qkv, spt_qkv, text_feat, class_gt=batch['query_class_presence'].flatten(), thr=0.4, resize=resize, text_weight=0.2, qry_img=qry_img, spt_img=spt_img)
+                else:
+                    spt_mask, qry_mask = self.generate_pseudo_mask(qry_qkv, spt_qkv, class_gt=batch['query_class_presence'].flatten(), thr=0.4, resize=resize)
 
-                #SAM EMBEDDINGS shape is [1, 256, 64, 64]
+                if self.use_sam:
 
-                for i in range(B):
-                    #q_img = qry_img[i, :]
-                    support_img = spt_img[i, :]
-                    s_img = support_img.permute(1, 2, 0).detach().cpu().numpy()
-                    s_img = (s_img * 255).astype(np.uint8)
+                    spt_mask = []
 
-                    self.predictor.set_image(s_img)
-                    mask_to_refine = mask_s[i, :].unsqueeze(0)
-                    img_w, img_h = mask_to_refine.shape[-2:]
+                    #SAM EMBEDDINGS shape is [1, 256, 64, 64]
 
-                    #print(f'\nmask to refine has shape: {mask_to_refine.shape}')
-                    
-                    spt_pts = spt_points[i, :].unsqueeze(0).float()
-                    
-                    #print(f'feeding into sam spt_pts of shape: {spt_pts.shape}')
-                    labels = torch.ones(spt_pts.shape[1]).unsqueeze(0).to(spt_img.device)
-                    labels[:, -2:] = 0
+                    for i in range(B):
+                        #q_img = qry_img[i, :]
+                        support_img = spt_img[i, :]
+                        s_img = support_img.permute(1, 2, 0).detach().cpu().numpy()
+                        s_img = (s_img * 255).astype(np.uint8)
 
-                    #print('These are the labels: ', labels)
-                    
-                    spt_pts = self.predictor.transform.apply_coords_torch(spt_pts, original_size=(img_h, img_w))
+                        self.predictor.set_image(s_img)
+                        mask_to_refine = mask_s[i, :].unsqueeze(0)
+                        #img_w, img_h = mask_to_refine.shape[-2:]
 
-                    #if i==0:
-                        #print(f'Points fed into SAM are: {spt_pts}')
-
-                    masks, scores, logits = self.predictor.predict_torch(
-                        point_coords=spt_pts,
-                        point_labels=labels,
-                        #mask_input=mask_to_refine,
-                        multimask_output=False
-                    )
-
-                    spt_mask.append(masks)
-                    
-                    #masks = logits[torch.argmax(scores), :, :]
-
-                    #print(f'mask from SAM has a score: {scores}')
-                '''
-                    mask_to_refine = mask_to_refine.unsqueeze(1)
-                    mask_to_refine = F.interpolate(mask_to_refine, resize, mode='bilinear', align_corners=False).squeeze(1)
-                    if self.training and self.global_rank == 0:
-                        self.save_debug_image(
-                            image=support_img,
-                            mask=mask_to_refine,
-                            points=spt_pts[0],
-                            labels=labels[0],
-                            name=f"SAM5neg2_epoch{self.current_epoch+i}_support.png"
-                        )'''
+                        #print(f'\nmask to refine has shape: {mask_to_refine.shape}')
                         
-                    
-                '''
-                    for i, (mask, score) in enumerate(zip(masks, scores)):
-                        mean = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
-                        std  = torch.tensor([0.229, 0.224, 0.225])[:, None, None]
-
-                        img = support_img.detach().cpu()
-                        img = img * std + mean
-                        img = img.clamp(0, 1)
-                        img = img.permute(1, 2, 0)
+                        spt_pts = spt_points[i, :].unsqueeze(0).float()
                         
-                        plt.figure(figsize=(10,10))
-                        plt.imshow(img)
-                        self.show_mask(mask, plt.gca())
-                        self.show_points(spt_pts, labels, plt.gca())
-                        score = score.detach().cpu().numpy()
-                        plt.title(f"Mask {i+1}, Score: {score:.3f}", fontsize=18)
-                        plt.axis('off')
-                        plt.show() 
-                        ''' 
-
-                    #mask = torch.from_numpy(mask[0]).to(spt_img.device)
-                    #print(f'generated mask of shape: {masks.shape}')
+                        #print(f'feeding into sam spt_pts of shape: {spt_pts.shape}')
+                        labels = torch.ones(spt_pts.shape[1]).unsqueeze(0).to(spt_img.device)
+                        labels[:, -2:] = 0
+                        
+                        #print('These are the labels: ', labels.shape)
+                        
+                        #spt_pts = self.predictor.transform.apply_coords_torch(spt_pts, original_size=(img_h, img_w)) DO NOT USE
+                        '''
+                        if i==0:
+                            print(f'Points fed into SAM are: {spt_pts.shape}')
+                            print(f'first point is: {spt_pts[:, 0, :]}')
+                            print(f'spt pts of {spt_pts[:, 0, :].shape}')
+                            print(f'labels pts of {labels[:, 0].shape}')
+                        '''
                     
-                spt_mask = torch.stack(spt_mask, dim=0)
-                spt_mask = spt_mask.squeeze(1).squeeze(1)
-                
-                
-                batch['query_pmask'] = qry_mask  # used only for avg-head-pseudo-mask training
-                batch['support_pmasks'] = spt_mask #.float()  # only used for vis
+                        first_point = spt_pts[:, 0, :].unsqueeze(0)
+                        #print(f'first point is: {first_point.shape}')
+                        
 
-                qry_qkv = qry_qkv.repeat_interleave(self.args.way, dim=1)
+                        masks, scores, logits = self.predictor.predict_torch(
+                            point_coords=first_point,
+                            point_labels=labels[:, 0:1],
+                            multimask_output=True
+                        )
+
+                        best = scores.argmax()
+                        #print(f'best is {best}')
+                        #print(f'logit of shape {logits.shape}')
+                        mask_input = logits[:, best, :, :]
+                        #print(f'Mask input is of shape: {masks.shape}')
+
+                        masks, scores, logits = self.predictor.predict_torch(
+                            point_coords=spt_pts,
+                            point_labels=labels,
+                            mask_input=mask_input,
+                            multimask_output=False
+                        )
+
+                        spt_mask.append(masks)
+                        
+                        #masks = logits[torch.argmax(scores), :, :]
+
+                        #print(f'mask from SAM has a score: {scores}')
+                    
+
+                    '''
+                        mask_to_refine = mask_to_refine.unsqueeze(1)
+                        mask_to_refine = F.interpolate(mask_to_refine, resize, mode='bilinear', align_corners=False).squeeze(1)
+                        if self.training and self.global_rank == 0:
+                            self.save_debug_image(
+                                image=support_img,
+                                mask=mask_to_refine,
+                                points=spt_pts[0],
+                                labels=labels[0],
+                                name=f"_wSAM5neg2_epoch{self.current_epoch+i}_support.png",
+                                dir=self.debug_dir_refine
+                            )
+                            self.save_debug_image(
+                                image=support_img,
+                                mask=mask_input,
+                                points=spt_pts[0],
+                                labels=labels[0],
+                                name=f"_wSAM5neg2_epoch{self.current_epoch+i}_support.png",
+                                dir=self.debug_dir_mask
+                            )
+                            '''
+            
+                        #mask = torch.from_numpy(mask[0]).to(spt_img.device)
+                        #print(f'generated mask of shape: {masks.shape}')
+                    
+                    spt_mask = torch.stack(spt_mask, dim=0)
+                    spt_mask = spt_mask.squeeze(1).squeeze(1)
+                    
+                if self.use_text and not self.use_sam:
+                    spt_mask = mask_s
+
+            batch['query_pmask'] = qry_mask  # used only for avg-head-pseudo-mask training
+            batch['support_pmasks'] = spt_mask #.float()  # only used for vis
+
+            qry_qkv = qry_qkv.repeat_interleave(self.args.way, dim=1)
                 #print(f'final mask of shape: {spt_mask.shape}')
 
             qry_feats = qry_feats_extr['layer_features']
@@ -351,7 +349,8 @@ class ClfSegTransformer(FSCSModule):
         mask=None,      # torch.Tensor [H,W] opzionale
         points=None,    # torch.Tensor [N,2] opzionale
         labels=None,    # torch.Tensor [N] opzionale
-        name="debug.png"
+        name="debug.png",
+        dir=None
     ):
         # ---- sicurezza DDP ----
         if self.global_rank != 0:
@@ -382,7 +381,7 @@ class ClfSegTransformer(FSCSModule):
             self.show_points(points, labels, plt.gca())
 
         # ---- save & cleanup ----
-        out_path = self.debug_dir / name
+        out_path = dir / name
         fig.savefig(out_path, bbox_inches="tight", dpi=150)
         plt.close(fig)
 
@@ -407,7 +406,7 @@ class ClfSegTransformer(FSCSModule):
         pos_points = coords[labels==1]
         neg_points = coords[labels==0]
         ax.scatter(pos_points[:, 0], pos_points[:, 1], color='green', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)
-        ax.scatter(neg_points[:, 0], neg_points[:, 1], color='red', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)   
+        ax.scatter(neg_points[:, 0], neg_points[:, 1], color='red', marker='.', s=100, edgecolor='white', linewidth=1.25)   
         
     def extract_clip_feats(self, img, return_qkv=False):
         feat = self.backbone.encode_image(img, n_layers=self.layers_to_take, return_qkv=return_qkv) 
@@ -418,55 +417,9 @@ class ClfSegTransformer(FSCSModule):
         mx = x.max(dim=2, keepdim=True)[0].max(dim=3, keepdim=True)[0]
 
         return (x - mn) / (mx - mn + 1e-6)
-    
-    def generate_clip_gradcam_pseudo_masks(self, qry_qkv, spt_qkv, resize, gt_presence, thr=0.2):
-
-        '''Class conditional activation score where channel importance is mean-over-heads'''
-        
-        _, B, N, L, C = qry_qkv.shape
-        spt_cls = spt_qkv[0, :, :, 0, :]
-        qry_key = qry_qkv[1]
-        spt_key = spt_qkv[1]
-
-        spt_patch = spt_key[:, :, 1:, :]
-        qry_patch = qry_key[:, :, 1:, :]
-
-        h = w = int(self.imgsize // 16)
-        ch = int(C // self.nhead)
-
-        qry_key = rearrange(qry_key, 'b n (h w) c -> b n h w c', h=h, w=w)
-        spt_key = rearrange(spt_key, 'b n (h w) c -> b n h w c', h=h, w=w)
-
-        qry_patch = F.normalize(qry_patch, p=2, dim=-1)
-        spt_patch = F.normalize(spt_patch, p=2, dim=-1)
-        spt_cls = F.normalize(spt_cls, p=2, dim=-1)
-
-        cam_weights = spt_cls.mean(dim=1)
-
-        qry_cam = torch.einsum('b n h w c, b c -> b n h w', qry_key, cam_weights)
-        spt_cam = torch.einsum('b n h w c, b c -> b n h w', spt_key, cam_weights)
-
-        qry_cam = qry_cam.mean(dim=1, keepdim=True)
-        spt_cam = spt_cam.mean(dim=1, keepdim=True)
-
-        qry_cam = F.relu(qry_cam)
-        spt_cam = F.relu(spt_cam)
-
-        qry_cam = self.normalize_map(qry_cam)
-        spt_cam = self.normalize_map(spt_cam)
-
-        qry_mask = F.interpolate(qry_cam, resize, mode='bilinear', align_corners=True).squeeze(1)
-        spt_mask = F.interpolate(spt_cam, resize, mode='bilinear', align_corners=True).squeeze(1)
-        
-        qry_mask = (qry_mask > thr).float()
-        spt_mask = (spt_mask > thr).float()
-
-        qry_mask[gt_presence.squeeze(-1) == False] = 0.
-
-        return qry_mask, spt_mask
 
     @torch.enable_grad()
-    def generate_pseudo_mask(self, qry_qkv, spt_qkv, text_feat, class_gt, resize=(800, 800), thr=0.4, text_weight=0.2, 
+    def generate_pseudo_mask(self, qry_qkv, spt_qkv, class_gt, text_feat=None, resize=(800, 800), thr=0.4, text_weight=0.2, 
                              qry_img=None, spt_img=None):
         # 0-th token: cls token
         # 1-HW token: img token
@@ -483,31 +436,45 @@ class ClfSegTransformer(FSCSModule):
         qry_key = rearrange(qry_key, 'b n (h w) c -> b n h w c', h=h, w=w)
         spt_key = rearrange(spt_key, 'b n (h w) c -> b n h w c', h=h, w=w)
 
-        text_feat = self.text_project(text_feat)
-        #text_feat = text_feat @ self.backbone.vision_projection.t()
-        text_feat = F.normalize(text_feat, p=2, dim=-1)
-        text_feat = rearrange(text_feat, 'b (n d) -> b n d', n=self.nhead)
-
         qry_key = F.normalize(qry_key, p=2, dim=-1)
         spt_key = F.normalize(spt_key, p=2, dim=-1)
         spt_cls = F.normalize(spt_cls, p=2, dim=-1)
 
+        if self.use_text:
+            text_feat = self.text_project(text_feat)
+            text_feat = F.normalize(text_feat, p=2, dim=-1)
+            text_feat = rearrange(text_feat, 'b (n d) -> b n d', n=self.nhead)
+
+            text_qry_corr = torch.einsum('b n h w c, b n c -> b n h w', qry_key, text_feat).mean(dim=1, keepdim=True)
+            text_spt_corr = torch.einsum('b n h w c, b n c -> b n h w', spt_key, text_feat).mean(dim=1, keepdim=True)
+
         cros_corr = torch.einsum('b n h w c, b n c -> b n h w', qry_key, spt_cls)
         self_corr = torch.einsum('b n h w c, b n c -> b n h w', spt_key, spt_cls)
+        
+        if not self.use_text:
+            self_corr = self_corr.mean(dim=1, keepdim=True)
+            cros_corr = cros_corr.mean(dim=1, keepdim=True)
 
-        text_qry_corr = torch.einsum('b n h w c, b n c -> b n h w', qry_key, text_feat).mean(dim=1, keepdim=True)
-        text_spt_corr = torch.einsum('b n h w c, b n c -> b n h w', spt_key, text_feat).mean(dim=1, keepdim=True)
+            self_corr = F.interpolate(self_corr_combined, resize, mode='bilinear', align_corners=True).squeeze(1)
+            cros_corr = F.interpolate(cros_corr_combined, resize, mode='bilinear', align_corners=True).squeeze(1)
 
-        self_corr = self_corr.mean(dim=1, keepdim=True)
-        cros_corr = cros_corr.mean(dim=1, keepdim=True)
+            cros_corr_ret = (cros_corr + 1.) * .5  # [-1, 1] -> [0, 1]
+            self_corr_ret = (self_corr + 1.) * .5  # [-1, 1] -> [0, 1]
 
+            ret_self = (self_corr_ret > thr).float()
+            ret_cros = (cros_corr_ret > thr).float()
+
+            ret_cros[class_gt.squeeze(-1) == False] = 0.
+
+            return ret_self, ret_cros
+        
         cros_corr_combined = (1 - text_weight) * cros_corr + text_weight * text_spt_corr
         cros_corr_combined = cros_corr_combined.mean(dim=1, keepdim=True)
 
         self_corr_combined = (1 - text_weight) * self_corr + text_weight * text_qry_corr
         self_corr_combined = self_corr_combined.mean(dim=1, keepdim=True)
 
-        self_corr = F.interpolate(self_corr_combined, (256, 256), mode='bilinear', align_corners=True).squeeze(1)
+        self_corr = F.interpolate(self_corr_combined, resize, mode='bilinear', align_corners=True).squeeze(1)
         cros_corr = F.interpolate(cros_corr_combined, resize, mode='bilinear', align_corners=True).squeeze(1)
         p_self_corr = F.interpolate(self_corr_combined, resize, mode='bilinear', align_corners=True).squeeze(1)
 
@@ -550,7 +517,7 @@ class ClfSegTransformer(FSCSModule):
         #print(f'\nFlat self is of shape: {flat_self.shape}')
         #print(f'Because it was flattened a tensor of shape: {points_self_ret.shape} and not from {ret_self.shape}')
 
-        k = 5 
+        k = 3 
 
         vals_c, idx_c = torch.topk(flat_cros, k=k, dim=1)
         vals_s, idx_s = torch.topk(flat_self, k=k, dim=1)
@@ -558,11 +525,12 @@ class ClfSegTransformer(FSCSModule):
         #print(f'After topk, we obtain indices of shape: {idx_s.shape}')
         #print(f'These indices are: {idx_s}')
 
-        n = 4
+        n = 2
         neg_points = []
-
+        #print(f'perhaps there is a mistake.. {ret_self.shape}')
         for b in range(ret_self.shape[0]):
             neg_x, neg_y = torch.where(ret_self[b] == 0.)
+            #print(f'negative samples are in {neg_x}, {neg_y}')
             x = neg_x.numel()
             perm = torch.randperm(x)[:n]
             neg_points.append(torch.stack([neg_x[perm], neg_y[perm]], dim=-1))

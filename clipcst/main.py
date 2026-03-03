@@ -36,8 +36,14 @@ if __name__ == '__main__':
     parser.add_argument('--vis', action='store_true', help='Flag to visualize. Use with --eval')
     parser.add_argument('--imgsize', type=int, default=800, help='image size')  # not variable
     parser.add_argument('--nlayers', type=int, default=12, help="n-layers to use for feature extraction")
+    parser.add_argument('--use_text', type=bool, default=True, help='Use text correlation for pseudo-mask generation')
+    parser.add_argument('--use_sam', type=bool, defaul=True, help='Use SAM for pseudo-mask generation')
+    parser.add_argument('--debug', type=bool, action='store_true', help='Flag to set debug environment')
 
     args = parser.parse_args()
+
+    if args.debug:
+        args.nowandb = True
 
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
@@ -47,12 +53,12 @@ if __name__ == '__main__':
     # Pytorch-lightning main trainer
     ckpt_callback = CustomCheckpoint(args)
     trainer = Trainer(strategy=DDPPlugin(find_unused_parameters=True), # DistributedDataParallel
-                    #strategy=SingleDeviceStrategy(device=torch.device("cuda:3")), 
+                    #strategy=SingleDeviceStrategy(device=torch.device("cuda:2")), 
                     callbacks=[CustomCheckpoint(args), CustomProgressBar(args)],
-                    gradient_clip_val=1.0,
+                    #gradient_clip_val=1.0,
                     accelerator='gpu',
-                    devices=torch.cuda.device_count(),
-                    #devices= 1,#[3] 
+                    #devices=torch.cuda.device_count(),
+                    devices=2,#[3] 
                     logger=False if args.nowandb or args.eval else OnlineLogger(args),
                     max_epochs=args.maxepochs,
                     num_sanity_val_steps=0,

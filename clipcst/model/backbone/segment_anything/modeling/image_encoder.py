@@ -113,6 +113,8 @@ class ImageEncoderViT(nn.Module):
 
         x = self.neck(x.permute(0, 3, 1, 2))
 
+        #print(f'In img encoder they are of shape: {x.shape}')
+
         return x
 
 
