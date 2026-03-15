@@ -89,7 +89,7 @@ class FSCSModule(pl.LightningModule, metaclass=abc.ABCMeta):
         # FYI: K-shot is always fixed to 1 for training
         """
 
-        output_cls, output_masks = self.forward(batch)
+        output_cls, output_masks, distill_mask = self.forward(batch)
         #, spt_keys_m 
         '''
         with torch.no_grad():
@@ -107,7 +107,7 @@ class FSCSModule(pl.LightningModule, metaclass=abc.ABCMeta):
         #print('predicted segmentation shape: ', pred_seg.shape)
 
         if self.sup == 'pseudo':
-            loss = self.compute_objective(output_cls, output_masks, gt_presence=batch['query_class_presence'], gt_mask=batch['query_pmask'])#, batch['support_classes'], spt_keys_m)
+            loss = self.compute_objective(output_cls, output_masks, gt_presence=batch['query_class_presence'], gt_mask=batch['query_pmask'], pmask=distill_mask)#, batch['support_classes'], spt_keys_m)
         elif self.sup == 'mask':
             loss = self.compute_objective(output_cls, output_masks, gt_presence=batch['query_class_presence'], gt_mask=batch['query_mask'])#, batch['support_classes'], spt_keys_m)
 

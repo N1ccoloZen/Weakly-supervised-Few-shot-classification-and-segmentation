@@ -36,14 +36,17 @@ if __name__ == '__main__':
     parser.add_argument('--vis', action='store_true', help='Flag to visualize. Use with --eval')
     parser.add_argument('--imgsize', type=int, default=800, help='image size')  # not variable
     parser.add_argument('--nlayers', type=int, default=12, help="n-layers to use for feature extraction")
-    parser.add_argument('--use_text', type=bool, default=True, help='Use text correlation for pseudo-mask generation')
-    parser.add_argument('--use_sam', type=bool, defaul=True, help='Use SAM for pseudo-mask generation')
-    parser.add_argument('--debug', type=bool, action='store_true', help='Flag to set debug environment')
+    parser.add_argument('--use_text', action='store_true', help='Use text correlation for pseudo-mask generation')
+    parser.add_argument('--use_sam', action='store_true', help='Use SAM for pseudo-mask generation')
+    parser.add_argument('--debug', action='store_true', help='Flag to set debug environment')
+    parser.add_argument('--distill', action='store_true', help='Flag for using sam-distillation')
 
     args = parser.parse_args()
 
     if args.debug:
         args.nowandb = True
+    if args.distill:
+        args.use_sam = True
 
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
