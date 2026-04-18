@@ -56,12 +56,12 @@ if __name__ == '__main__':
     # Pytorch-lightning main trainer
     ckpt_callback = CustomCheckpoint(args)
     trainer = Trainer(strategy=DDPPlugin(find_unused_parameters=True), # DistributedDataParallel
-                    #strategy=SingleDeviceStrategy(device=torch.device("cuda:2")), 
+                    #strategy=SingleDeviceStrategy(device=torch.device("cuda:0")), 
                     callbacks=[CustomCheckpoint(args), CustomProgressBar(args)],
-                    #gradient_clip_val=1.0,
+                    gradient_clip_val=1.0,
                     accelerator='gpu',
-                    #devices=torch.cuda.device_count(),
-                    devices=2,#[3] 
+                    devices=torch.cuda.device_count(),
+                    #devices=2,#[3] 
                     logger=False if args.nowandb or args.eval else OnlineLogger(args),
                     max_epochs=args.maxepochs,
                     num_sanity_val_steps=0,

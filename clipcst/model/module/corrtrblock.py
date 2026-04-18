@@ -12,17 +12,57 @@ class CorrTransformBlock(nn.Module):
     - cross-attention
     - feed-forward
     """
+
+    '''idk why but I changed corrtransformer...'''
+
+    #use this from distillW1 (look wandb) baseSAMWS3, 2, 1, 0
+    def __init__(self, in_channels, out_channels, kernel_size, stride, clip_dim, padding=0, bias=True, heads=8, groups=4):
+        super(CorrTransformBlock, self).__init__()
+        
+        self.norm1 = nn.GroupNorm(groups, in_channels)
+        self.attn = Attention(in_channels, out_channels, kernel_size, stride, padding, bias, heads, groups)
+
+        self.norm2 = nn.GroupNorm(groups, out_channels)
+        self.cross_attn = CrossAttention(in_channels=out_channels, clip_dim=clip_dim, heads=heads, groups=groups)
+
+        self.norm3 = nn.GroupNorm(groups, out_channels)
+        self.ff = FeedForward(out_channels, groups)
+        self.proj = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            RearrangeAndAvgpool(
+                ksz_q=(1, kernel_size, kernel_size),
+                str_q=(1, stride, stride),
+                pad_q=(0, padding, padding)
+            ),
+            nn.GroupNorm(groups, out_channels)
+        ) if (in_channels != out_channels or stride != 1) else nn.Identity()
+
+        #self.film = FiLMConditioner(clip_dim, out_channels)
+        #self.norm_film = nn.GroupNorm(groups, out_channels)
+    
+    def forward(self, x, support_mask, text_feat):
+        out = self.attn((self.norm1(x), support_mask))
+        out = out + self.proj(x)
+
+        out = out + self.cross_attn(self.norm2(out), text_feat)
+        out = out + self.ff(self.norm3(out))
+
+        #out = out + self.film(self.norm_film(out), text_feat)
+        return out, support_mask
+    
+
+    '''distillWS0, b_textws3 and earlier
     def __init__(self, in_channels, out_channels, kernel_size, stride, clip_dim, padding=0, bias=True, heads=8, groups=4):
         super(CorrTransformBlock, self).__init__()
         self.attn = Attention(in_channels, out_channels, kernel_size, stride, padding, bias, heads, groups)
         self.cross_attn = CrossAttention(in_channels=out_channels, clip_dim=clip_dim, heads=heads, groups=groups)
         self.ff = FeedForward(out_channels, groups)
 
-    def forward(self, x, support_mask, text_embeds):
+    def forward(self, x, support_mask, text_embeds, text_not=None):
         out = self.attn((x, support_mask))
         out = self.cross_attn(out, text_embeds)
         out = self.ff(out)
-        return out, support_mask
+        return out, support_mask'''
 
 class CrossAttention(nn.Module):
     '''Perform cross-attention on text tokens and intermediate features from self-attention'''
@@ -39,11 +79,12 @@ class CrossAttention(nn.Module):
         self.norm = nn.GroupNorm(groups, in_channels)
         self.relu = nn.ReLU(inplace=True)
 
-    def forward(self, x, text_embeds):
+    def forward(self, x, text_feat):
         B, C, Q, S = x.shape
-        scale = (C // self.nheads) ** 0.5
-        text_embeds = self.text_projection(text_embeds) #[B, in_channel]
+        scale = (C // self.nheads) ** -0.5
+        text_embeds = self.text_projection(text_feat) #[B, in_channel]
         text_embeds = rearrange(text_embeds.unsqueeze(-1), 'b c s -> b s c')
+        #text_embeds = rearrange(text_embeds, 'b c s -> b s c')
         
         query = self.qry(x)
         key = self.key(text_embeds)
@@ -54,7 +95,20 @@ class CrossAttention(nn.Module):
         value = rearrange(value, 'b s (g c) -> b g c s', g=self.nheads)
 
         attn = torch.einsum('b g c t s, b g c w -> b g t s w', query, key) * scale
+
+        #query = rearrange(query, 'b (g c) s t -> b g c s t', g=self.nheads)
+        #key = rearrange(key, 'b s (g c) -> b g c s', g=self.nheads)
+        #value = rearrange(value, 'b s (g c) -> b g c s', g=self.nheads)
+
+        #attn = torch.einsum('b g c t s, b g c w -> b g t s w', query, key) * scale
+        if text_embeds is None:
+        # positions after EoT are padding (token id 0 after argmax position)
+            eot_idx = text_feat.argmax(dim=-1)             # [B]
+            mask = torch.arange(77, device=x.device).unsqueeze(0) > eot_idx.unsqueeze(1)  # [B, 77]
+            mask = mask[:, None, None, :]              # [B, 1, 1, 1, 77]
+            attn = attn.masked_fill(mask, float('-inf'))
         attn = F.softmax(attn, dim=-1)
+        #print(f'attn shape: {attn.shape}')
 
         out = torch.einsum('b g t s w, b g c w -> b g c t s', attn, value)
         out = rearrange(out, 'b g c t s -> b (g c) t s')
@@ -186,3 +240,26 @@ class FeedForward(nn.Module):
         x_ = x
         out = self.ff(x)
         return self.out_norm(out + x_)
+    
+    
+class FiLMConditioner(nn.Module):
+    #https://arxiv.org/pdf/1709.07871
+    def __init__(self, clip_dim, num_channels):
+        super().__init__()
+
+        self.proj = nn.Linear(clip_dim, 2* num_channels)
+
+        nn.init.zeros_(self.proj.weight)
+        nn.init.ones_(self.proj.bias[:num_channels])
+        nn.init.zeros_(self.proj.bias[:num_channels])
+
+    def forward(self, x, text_embed):
+        if text_embed.dim() == 3:
+            text_embed = text_embed.squeeze(1)
+
+        params = self.proj(text_embed)
+        gamma, beta = params.chunk(2, dim=-1)
+        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+        beta = beta.unsqueeze(-1).unsqueeze(-1)
+
+        return gamma * x + beta

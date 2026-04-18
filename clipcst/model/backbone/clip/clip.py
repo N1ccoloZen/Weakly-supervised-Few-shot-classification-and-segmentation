@@ -128,7 +128,7 @@ class Attention(nn.Module):
         self.qkv = nn.Linear(embed_dim, embed_dim*3, bias=qkv_bias)
         self.proj = nn.Linear(embed_dim, embed_dim, bias=proj_bias)
 
-    def forward(self, x, return_qkv=False):
+    def forward(self, x, return_qkv=False, return_attn=False):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
 
@@ -143,6 +143,9 @@ class Attention(nn.Module):
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
 
+        if return_attn:
+            #print(f'returning attention: {return_attn}')
+            return x, attn
         return x, attn
     
 class PatchEmbed(nn.Module):
@@ -193,12 +196,12 @@ class Block(nn.Module):
 
         self.drop_path = nn.Identity()
 
-    def forward(self, x, return_qkv=False):
+    def forward(self, x, return_qkv=False, return_attn=False):
         if return_qkv:
             qkv = self.attn(self.norm1(x), return_qkv=return_qkv)
             return qkv
         
-        attn_out, attn  = self.attn(self.norm1(x))
+        attn_out, attn  = self.attn(self.norm1(x), return_attn=return_attn)
         #print('Attn shape is:', attn_out.shape)
         if self.ls1 is not None:
             x = x + self.drop_path(self.ls1 * attn_out)
@@ -207,7 +210,7 @@ class Block(nn.Module):
             x = x + self.drop_path(attn_out)
             x = x + self.drop_path(self.mlp(self.norm2(x)))
 
-        return x
+        return x, attn
     
 class Transformer(nn.Module):
     def __init__(self, width=384, layers=12, heads=6, attn_mask=None):
@@ -356,7 +359,7 @@ class ClipVisionTransformer(nn.Module):
         x = [self.prepare_tokens_with_masks(x, mask) for x, mask in zip(x_list, mask_list)]
 
         for blk in self.block:
-            x = blk(x)
+            x, _ = blk(x)
 
         all_x = x
         output = []
@@ -383,7 +386,7 @@ class ClipVisionTransformer(nn.Module):
         x = self.prepare_tokens_with_masks(x, mask)
 
         for blk in self.block:
-            x = blk(x)
+            x, _ = blk(x)
 
         x_norm = self.norm(x)
 
@@ -393,24 +396,35 @@ class ClipVisionTransformer(nn.Module):
             "x_prenorm": x,
             "masks": mask,
         }
-    def get_intermediate_layers(self, x, n_layers, return_qkv=False, return_class_token=False):
-        x = self.prepare_tokens_with_masks(x)
+    def get_intermediate_layers(self, x, n_layers, 
+        return_qkv=False, 
+        return_class_token=False, 
+        return_attn=False):
 
+        x = self.prepare_tokens_with_masks(x)
+        #print(f'return attention is {return_attn}')
         output, total_block_len = [], len(self.block)
+        attn_maps = []
         #blocks_to_take = [2, 5, 8, 11]   #blocks from 0 to 11 -> 12 total
         blocks_to_take = range(total_block_len - n_layers, total_block_len) if isinstance(n_layers, int) else n_layers
         for i, blk in enumerate(self.block):
             blk.eval()
-            if return_qkv:
+            if return_qkv and i == len(self.block)-1:
                 qkv = blk(x, return_qkv=return_qkv)
-            x = blk(x)
+                x, attn = blk(x, return_attn=return_attn)
+            else:
+                x, attn = blk(x, return_attn=return_attn)
+
             if i in blocks_to_take:
                 output.append(x)
-            if return_qkv and i == len(self.block)-1:
-                qkv_final = qkv
+                attn_maps.append(attn)
+
+        result = {'layer_features': output}
         if return_qkv:
-            return output, qkv_final
-        return output
+            result['qkv_final'] = qkv
+        if return_attn:
+            result['attn_maps'] = attn_maps
+        return result
     
     def forward(self, *args, is_training=False, **kwargs):
         feats = self.forward_features(*args, **kwargs)
@@ -476,21 +490,26 @@ class CLIPFeatureExtractor(nn.Module):
         nn.init.normal_(self.text_projection, std=self.transformer_dim ** -0.5)
         nn.init.normal_(self.vision_projection, std=self.vision_dim ** -0.5)
 
-    def encode_image(self, img, n_layers=None, return_qkv=False, normalize=True, mask=None):
+    def encode_image(self, img, n_layers=None, return_qkv=False, normalize=True, mask=None, return_attn=False):
         
         if n_layers is not None:
             layer_out = self.vision.get_intermediate_layers(
                 img,
                 n_layers=n_layers,
                 return_qkv=return_qkv,
-                return_class_token=False
+                return_class_token=False,
+                return_attn=return_attn
             )
 
-            if return_qkv:
+            layer_features = layer_out['layer_features']
+            qkv = layer_out.get('qkv_final', None)
+            attn_maps = layer_out.get('attn_maps', None)
+            
+            '''if return_qkv
                 layer_features, qkv = layer_out
             else:
                 layer_features = layer_out
-                qkv = None
+                qkv = None'''
 
             final_cls = self.vision.norm(layer_features[-1])[:,0]
             embeds = final_cls @ self.vision_projection
@@ -507,6 +526,8 @@ class CLIPFeatureExtractor(nn.Module):
 
             if return_qkv:
                 result['qkv_data'] = qkv
+            if return_attn:
+                result['attn_maps'] = attn_maps
             
             #output = [out[:, 1:] for out in layer_features]
 
@@ -541,12 +562,13 @@ class CLIPFeatureExtractor(nn.Module):
         x, qkv = self.text(x, return_qkv=return_qkv)
         x = x.permute(1, 0, 2)
         x = self.layernorm_final(x)
-
+        token_features = x
         #features from EoT embedding (highest token id)
         #print(' -> encode_text output before text_projection: ', x.shape)
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
 
-        result = {'embedding' : F.normalize(x, dim=-1) if normalize else x}
+        result = {'embedding' : F.normalize(x, dim=-1) if normalize else x,
+                  'token_features': token_features}
 
         return result
 

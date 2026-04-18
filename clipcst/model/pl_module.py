@@ -102,12 +102,16 @@ class FSCSModule(pl.LightningModule, metaclass=abc.ABCMeta):
         '''
         pred_cls = self.predict_cls(output_cls)
         pred_seg = self.predict_mask(output_masks)
-
+        
         #print('predicted cls shape: ', pred_cls.shape)
         #print('predicted segmentation shape: ', pred_seg.shape)
 
         if self.sup == 'pseudo':
-            loss = self.compute_objective(output_cls, output_masks, gt_presence=batch['query_class_presence'], gt_mask=batch['query_pmask'], pmask=distill_mask)#, batch['support_classes'], spt_keys_m)
+            if self.args.distill:
+                #refined_mask = self.refine_mask(output_masks, batch)
+                loss = self.compute_objective(output_cls, output_masks, gt_presence=batch['query_class_presence'], gt_mask=batch['query_pmask'], pmask=distill_mask)#, batch['support_classes'], spt_keys_m)
+            else:
+                loss = self.compute_objective(output_cls, output_masks, gt_presence=batch['query_class_presence'], gt_mask=batch['query_pmask'], pmask=distill_mask)#, batch['support_classes'], spt_keys_m)
         elif self.sup == 'mask':
             loss = self.compute_objective(output_cls, output_masks, gt_presence=batch['query_class_presence'], gt_mask=batch['query_mask'])#, batch['support_classes'], spt_keys_m)
 

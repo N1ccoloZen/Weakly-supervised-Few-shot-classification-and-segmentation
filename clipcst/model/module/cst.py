@@ -1,5 +1,6 @@
 """ Correlation Transformer """
 import math
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
@@ -38,6 +39,7 @@ class CorrelationTransformer(nn.Module):
             modules.append(nn.ReLU(inplace=True))
 
         self.linear = nn.Sequential(*modules)
+        #self.text_to_cls = LateFusionText(clip_dim, visual_dim=64)
         
         # classification and segmentation task heads
         self.decoder1_cls = nn.Sequential(nn.Conv2d(128, 128, (1, 1), padding=(0, 0), bias=True),
@@ -75,9 +77,8 @@ class CorrelationTransformer(nn.Module):
 
         # classification
         out_cls = self.decoder1_cls(in_cls)
-        #text_cls = self.text_to_cls(text_embeds)
-        #text_cls = text_cls.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, H, W)
-        #out_cls = out_cls + text_cls
+        #out_cls = self.text_to_cls(out_cls, text_embeds)
+
         out_cls = F.avg_pool2d(out_cls, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))  # half-size
         out_cls = self.decoder2_cls(out_cls)
         out_cls = F.adaptive_avg_pool2d(out_cls, (1, 1)).squeeze(-1).squeeze(-1)
@@ -91,3 +92,26 @@ class CorrelationTransformer(nn.Module):
         # out_cls: [BN, 2] where N is numclass
         # output_masks: [BN, 2, H, W]
         return out_cls, out_masks
+
+
+class LateFusionText(nn.Module):
+    #https://arxiv.org/pdf/2110.04544
+    def __init__(self, clip_dim, visual_dim):
+        super().__init__()
+
+        self.proj = nn.Sequential(
+            nn.Linear(clip_dim, visual_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(visual_dim, visual_dim)
+        )
+
+        self.alpha = nn.Parameter(torch.zeros(1))
+
+    def forward(self, visual_feat, text_embed):
+        if text_embed.dim() == 3:
+            text_embed = text_embed.squeeze(1)
+
+        text_feat = self.proj(text_embed)
+        text_feat = text_feat.unsqueeze(-1).unsqueeze(-1)
+
+        return visual_feat + self.alpha * text_feat 
